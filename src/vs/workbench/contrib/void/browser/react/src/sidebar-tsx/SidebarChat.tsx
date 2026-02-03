@@ -1845,9 +1845,9 @@ const titleOfBuiltinToolName = {
 		running: loadingTitleWrapper("Reading file"),
 	},
 	ls_dir: {
-		done: "Inspected folder",
-		proposed: "Inspect folder",
-		running: loadingTitleWrapper("Inspecting folder"),
+		done: "Listed folder",
+		proposed: "List folder",
+		running: loadingTitleWrapper("Listing folder"),
 	},
 	get_dir_tree: {
 		done: "Inspected folder tree",

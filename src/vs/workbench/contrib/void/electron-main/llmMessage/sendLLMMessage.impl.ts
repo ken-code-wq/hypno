@@ -299,6 +299,9 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		{ tools: potentialTools } as const
 		: {}
 
+	// max tokens - ensure we have enough room for full responses
+	const maxTokens = getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel }) ?? 32_768
+
 	// instance
 	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider, includeInPayload })
 	if (providerName === 'microsoftAzure') {
@@ -309,9 +312,9 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		model: modelName,
 		messages: messages as any,
 		stream: true,
+		max_tokens: maxTokens,
 		...nativeToolsObj,
 		...additionalOpenAIPayload
-		// max_completion_tokens: maxTokens,
 	}
 
 	// open source models - manually parse think tokens
