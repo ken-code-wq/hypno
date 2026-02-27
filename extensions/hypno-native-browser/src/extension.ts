@@ -1,5 +1,215 @@
 import * as vscode from 'vscode';
 
+type StringMap = Record<string, string>;
+
+function clip(value: unknown, maxLength: number): string {
+	if (typeof value !== 'string') {
+		return '';
+	}
+	return value.length > maxLength ? `${value.slice(0, maxLength)}\n...[truncated]...` : value;
+}
+
+function getSelector(data: any): string {
+	const tagName = typeof data?.tagName === 'string' && data.tagName.trim().length > 0 ? data.tagName : 'element';
+	const firstClass = typeof data?.className === 'string'
+		? data.className.trim().split(/\s+/).find((part: string) => part.length > 0) ?? ''
+		: '';
+	const idSuffix = typeof data?.id === 'string' && data.id.length > 0 ? `#${data.id}` : '';
+	const classSuffix = firstClass ? `.${firstClass}` : '';
+	return `${tagName}${idSuffix}${classSuffix}`;
+}
+
+function toStringMap(value: unknown): StringMap {
+	if (!value || typeof value !== 'object') {
+		return {};
+	}
+
+	const result: StringMap = {};
+	for (const [key, rawValue] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof rawValue !== 'string') {
+			continue;
+		}
+		const trimmed = rawValue.trim();
+		if (trimmed.length > 0) {
+			result[key] = clip(trimmed, 320);
+		}
+	}
+	return result;
+}
+
+function limitEntries(input: StringMap, maxEntries: number): StringMap {
+	const output: StringMap = {};
+	for (const [key, value] of Object.entries(input).slice(0, maxEntries)) {
+		output[key] = value;
+	}
+	return output;
+}
+
+function selectStylesForHover(allStyles: StringMap): StringMap {
+	const preferred = [
+		'display',
+		'position',
+		'color',
+		'background-color',
+		'font-size',
+		'font-weight',
+		'font-family',
+		'line-height',
+		'text-align',
+		'border',
+		'border-radius',
+		'box-sizing'
+	];
+
+	const picked: StringMap = {};
+	for (const key of preferred) {
+		const value = allStyles[key];
+		if (typeof value === 'string' && value.trim().length > 0) {
+			picked[key] = value.trim();
+		}
+	}
+
+	if (Object.keys(picked).length === 0) {
+		return limitEntries(allStyles, 12);
+	}
+	return limitEntries(picked, 12);
+}
+
+function buildDomPayload(selector: string, data: any): string {
+	const cleanedHtml = clip(data?.cleanedHTML, 20000);
+	const layoutCss = clip(data?.layoutCSS, 8000);
+	const javascriptContext = clip(data?.javascriptContext, 8000);
+	const pageUrl = clip(data?.pageUrl, 2048) || 'Unknown URL';
+	const pageTitle = clip(data?.pageTitle, 512) || 'Untitled';
+	const xpath = clip(data?.xpath, 2048) || 'N/A';
+	const domPath = clip(data?.domPath, 2048) || 'N/A';
+	const innerText = clip(data?.innerText, 600) || 'N/A';
+	const attributes = limitEntries(toStringMap(data?.attributes), 12);
+
+	const lines: string[] = [
+		'[[HYPNO_DOM_REFERENCE]]',
+		'The user selected this live DOM node from the embedded browser.',
+		'Treat this as source-of-truth UI context and map it to existing app code before editing.',
+		'',
+		`Visible reference: ${selector}`,
+		`Page URL: ${pageUrl}`,
+		`Page Title: ${pageTitle}`,
+		`DOM Path: ${domPath}`,
+		`XPath: ${xpath}`,
+		`Inner Text: ${innerText}`,
+		'',
+	];
+
+	if (Object.keys(attributes).length > 0) {
+		lines.push('### Key Attributes');
+		for (const [key, value] of Object.entries(attributes)) {
+			lines.push(`${key}: ${value}`);
+		}
+		lines.push('');
+	}
+
+	lines.push(
+		'### HTML',
+		cleanedHtml || '(No HTML captured)',
+		'',
+		'### CSS',
+		layoutCss || '(No CSS captured)',
+		'',
+		'### JavaScript',
+		javascriptContext || '(No direct JS handlers captured on this element)',
+		'[[/HYPNO_DOM_REFERENCE]]'
+	);
+
+	return lines.join('\n');
+}
+
+function buildDomHoverData(selector: string, data: any): string {
+	const allStyles = toStringMap(data?.computedStyles);
+	const attributes = limitEntries(toStringMap(data?.attributes), 12);
+	const computedStyles = selectStylesForHover(allStyles);
+	const tagName = typeof data?.tagName === 'string' && data.tagName.length > 0 ? data.tagName : 'element';
+
+	const positionSource =
+		data?.position && typeof data.position === 'object'
+			? (data.position as Record<string, unknown>)
+			: {};
+
+	const roundedPosition: Record<string, number> = {};
+	for (const key of ['top', 'left', 'width', 'height']) {
+		const raw = positionSource[key];
+		if (typeof raw === 'number' && Number.isFinite(raw)) {
+			roundedPosition[key] = Math.round(raw * 100) / 100;
+		}
+	}
+
+	const hoverData = {
+		selector,
+		element: `<${tagName}>`,
+		tagName,
+		domPath: clip(data?.domPath, 2048) || '',
+		xpath: clip(data?.xpath, 2048) || '',
+		pageTitle: clip(data?.pageTitle, 512) || '',
+		pageUrl: clip(data?.pageUrl, 2048) || '',
+		attributes,
+		computedStyles,
+		position: roundedPosition,
+		innerText: clip(data?.innerText, 600) || ''
+	};
+
+	return JSON.stringify(hoverData);
+}
+
+function buildDomHoverPreview(selector: string, data: any): string {
+	const attributes = limitEntries(toStringMap(data?.attributes), 8);
+	const allStyles = toStringMap(data?.computedStyles);
+	const styles = selectStylesForHover(allStyles);
+
+	const lines: string[] = [
+		'ELEMENT',
+		selector,
+		'',
+		'PATH',
+		clip(data?.domPath, 1024) || 'N/A',
+		''
+	];
+
+	if (Object.keys(attributes).length > 0) {
+		lines.push('ATTRIBUTES');
+		for (const [key, value] of Object.entries(attributes)) {
+			lines.push(`${key}: ${value}`);
+		}
+		lines.push('');
+	}
+
+	if (Object.keys(styles).length > 0) {
+		lines.push('COMPUTED STYLES');
+		for (const [key, value] of Object.entries(styles)) {
+			lines.push(`${key}: ${value}`);
+		}
+		lines.push('');
+	}
+
+	const position = data?.position;
+	if (position && typeof position === 'object') {
+		lines.push('POSITION & SIZE');
+		for (const key of ['top', 'left', 'width', 'height']) {
+			const raw = (position as Record<string, unknown>)[key];
+			if (typeof raw === 'number' && Number.isFinite(raw)) {
+				lines.push(`${key}: ${Math.round(raw * 100) / 100}px`);
+			}
+		}
+		lines.push('');
+	}
+
+	const innerText = clip(data?.innerText, 320);
+	if (innerText) {
+		lines.push('INNER TEXT');
+		lines.push(innerText);
+	}
+
+	return lines.join('\n').trim();
+}
+
 export function activate(context: vscode.ExtensionContext) {
 	let currentPanel: vscode.WebviewPanel | undefined = undefined;
 
@@ -11,7 +221,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 		currentPanel = vscode.window.createWebviewPanel(
 			'hypno.browser',
-			'Native Browser',
+			'Browser',
 			vscode.ViewColumn.Active,
 			{ enableScripts: true, retainContextWhenHidden: true }
 		);
@@ -47,55 +257,29 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(openBrowserCommand);
 
-	// Phase 3: Handle element selected from Native Browser
+	// Handle element selected from Native Browser → inject into Continue input as an inline DOM pill
 	context.subscriptions.push(
-		vscode.commands.registerCommand('hypno.browser.onElementSelected', async (data: any) => {
-			let markdown = '';
+			vscode.commands.registerCommand('hypno.browser.onElementSelected', async (data: any) => {
+				const selector = getSelector(data);
+				const hiddenContent = buildDomPayload(selector, data);
+				const hoverData = buildDomHoverData(selector, data);
+				const hoverPreview = buildDomHoverPreview(selector, data);
+				const referenceId = `hypno-dom://${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-			if (data.html) {
-				markdown += `\`\`\`html\n${data.html}\n\`\`\`\n\n`;
-			}
+				try {
+				// Ensure Continue is activated before invoking the internal DOM-reference command.
+				await vscode.commands.executeCommand('continue.focusContinueInputWithoutClear');
 
-			if (data.css && Object.keys(data.css).length > 0) {
-				markdown += `**Computed Styles:**\n\`\`\`css\n`;
-				for (const [prop, value] of Object.entries(data.css)) {
-					markdown += `${prop}: ${value};\n`;
-				}
-				markdown += `\`\`\`\n`;
-			}
-
-			const tagName = data.tagName || 'element';
-			let identifier = '';
-			if (data.id) {
-				identifier = `#${data.id}`;
-			} else if (data.className) {
-				const firstClass = data.className.split(/\s+/)[0];
-				if (firstClass) identifier = `.${firstClass}`;
-			}
-
-			const safeIdentifier = identifier.replace(/[^a-zA-Z0-9#.-]/g, '_');
-			const fileName = `${tagName}${safeIdentifier}.md`;
-
-			try {
-				const os = require('os');
-				const path = require('path');
-				const fs = require('fs/promises');
-
-				const tempFilePath = path.join(os.tmpdir(), fileName);
-				await fs.writeFile(tempFilePath, markdown, 'utf-8');
-				const fileUri = vscode.Uri.file(tempFilePath);
-
-				await vscode.commands.executeCommand('continue.selectFilesAsContext', fileUri, [fileUri]);
-
-				// Add the tag to the clipboard so it gets pasted into the input alongside the file context
-				// Using backticks formats it as an inline code block, giving it chip-like styling
-				await vscode.env.clipboard.writeText(`\`<${tagName}/>\` `);
-
-				setTimeout(() => {
-					vscode.commands.executeCommand('editor.action.clipboardPasteAction');
-				}, 600);
-			} catch (e) {
-				console.error('Failed to write element temp file and inject to Continue: ', e);
+					await vscode.commands.executeCommand('continue.hypnoAddDomReference', {
+						referenceId,
+						label: selector,
+						hiddenContent,
+						hoverData,
+						hoverPreview,
+						renderInlineAs: selector
+					});
+				} catch (e) {
+				console.error('[Hypno] Failed to inject DOM pill context into Continue:', e);
 			}
 		})
 	);

@@ -610,6 +610,10 @@ export const messageOfSelection = async (
 		const contentStr = [folderStructure, ...strOfFiles].join('\n\n')
 		return contentStr
 	}
+	else if (s.type === 'Image') {
+		// Currently returning a placeholder string until Void's full message array parsing supports multimodal content natively
+		return `[Attached Screenshot Image Data: ${s.dataURI.substring(0, 50)}...]`
+	}
 	else
 		return ''
 

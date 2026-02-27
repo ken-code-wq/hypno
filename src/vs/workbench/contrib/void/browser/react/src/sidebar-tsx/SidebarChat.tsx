@@ -43,6 +43,8 @@ import {
 	VoidSlider,
 	VoidSwitch,
 	VoidDiffEditor,
+	getContentFromEditable,
+	getDisplayTextFromEditable,
 } from "../util/inputs.js";
 import { ModelDropdown } from "../void-settings-tsx/ModelDropdown.js";
 import { PastThreadsList } from "./SidebarThreadSelector.js";
@@ -81,7 +83,7 @@ import {
 	Folder,
 	ALargeSmall,
 	TypeOutline,
-	Text,
+	MousePointerClick,
 } from "lucide-react";
 import {
 	ChatMessage,
@@ -894,7 +896,7 @@ export const SelectedFiles = ({
 				.filter(
 					(uri) =>
 						!selections.find(
-							(s) => s.type === "File" && s.uri.fsPath === uri.fsPath,
+							(s) => s.type === "File" && s.uri?.fsPath === uri.fsPath,
 						),
 				)
 				.slice(0, maxProspectiveFiles);
@@ -950,16 +952,26 @@ export const SelectedFiles = ({
 									selection.language +
 									selection.state +
 									selection.uri.fsPath
-								: i;
+								: selection.type === "Image"
+									? selection.type + selection.dataURI
+									: i;
 
-				const SelectionIcon =
-					selection.type === "File"
-						? File
-						: selection.type === "Folder"
-							? Folder
-							: selection.type === "CodeSelection"
-								? Text
-								: (undefined as never);
+					const SelectionIcon =
+						selection.type === "File"
+							? FileIcon
+							: selection.type === "Folder"
+								? Folder
+								: selection.type === "CodeSelection"
+									? MousePointerClick
+									: selection.type === "Image"
+										? () => (
+												<img
+													src={selection.dataURI}
+												className="max-w-4 max-h-4 object-contain rounded-sm"
+												alt="Screen Capture"
+											/>
+										)
+									: (undefined as never);
 
 				return (
 					<div // container for summarybox and code
@@ -970,24 +982,36 @@ export const SelectedFiles = ({
 						<span
 							className="truncate overflow-hidden text-ellipsis"
 							data-tooltip-id="void-tooltip"
-							data-tooltip-content={getRelative(selection.uri, accessor)}
+							data-tooltip-content={
+								selection.type === "Image"
+									? "Captured Image"
+									: selection.type === "CodeSelection"
+										? `${getRelative(selection.uri, accessor)} (${selection.range[0]}-${selection.range[1]})`
+										: getRelative(selection.uri, accessor)
+							}
 							data-tooltip-place="top"
-							data-tooltip-delay-show={3000}
+							data-tooltip-delay-show={120}
 						>
 							{/* summarybox */}
 							<div
 								className={`
-								flex items-center gap-1 relative
-								px-1
-								w-fit h-fit
-								select-none
-								text-xs text-nowrap
-								border rounded-sm
-								${isThisSelectionProspective ? "bg-void-bg-1 text-void-fg-3 opacity-80" : "bg-void-bg-1 hover:brightness-95 text-void-fg-1"}
-								${isThisSelectionProspective ? "border-void-border-2" : "border-void-border-1"}
-								hover:border-void-border-1
-								transition-all duration-150
-							`}
+									flex items-center gap-1.5 relative
+									px-2 py-[2px]
+									w-fit h-fit
+									select-none
+									text-[11px] text-nowrap
+									border rounded-full
+									${isThisSelectionProspective ? "opacity-75" : "hover:brightness-95"}
+									transition-all duration-150
+								`}
+								style={{
+									background:
+										"color-mix(in srgb, #dbeafe 55%, var(--vscode-editor-background) 45%)",
+									color:
+										"color-mix(in srgb, #3366ad 82%, var(--vscode-editor-foreground) 18%)",
+									borderColor:
+										"color-mix(in srgb, #bfd5f7 70%, var(--vscode-editor-background) 30%)",
+								}}
 								onClick={() => {
 									if (type !== "staging") return; // (never)
 									if (isThisSelectionProspective) {
@@ -1021,20 +1045,22 @@ export const SelectedFiles = ({
 									}
 								}}
 							>
-								{<SelectionIcon size={10} />}
+								{<SelectionIcon size={12} />}
 
 								{
 									// file name and range
-									getBasename(selection.uri.fsPath) +
-										(selection.type === "CodeSelection"
-											? ` (${selection.range[0]}-${selection.range[1]})`
-											: "")
+									selection.type === "Image"
+										? "Screenshot"
+										: getBasename((selection as any).uri.fsPath) +
+											(selection.type === "CodeSelection"
+												? ` (${selection.range[0]}-${selection.range[1]})`
+												: "")
 								}
 
 								{selection.type === "File" &&
 								selection.state.wasAddedAsCurrentFile &&
 								messageIdx === undefined &&
-								currentURI?.fsPath === selection.uri.fsPath ? (
+								currentURI?.fsPath === (selection as any).uri?.fsPath ? (
 									<span
 										className={`text-[8px] 'void-opacity-60 text-void-fg-4`}
 									>
@@ -1420,8 +1446,9 @@ const UserMessageComponent = ({
 	const [isFocused, setIsFocused] = useState(false);
 	const [isHovered, setIsHovered] = useState(false);
 	const [isDisabled, setIsDisabled] = useState(false);
-	const [textAreaRefState, setTextAreaRef] =
-		useState<HTMLTextAreaElement | null>(null);
+	const [textAreaRefState, setTextAreaRef] = useState<HTMLDivElement | null>(
+		null,
+	);
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null);
 	// initialize on first render, and when edit was just enabled
 	const _mustInitialize = useRef(true);
@@ -1498,10 +1525,12 @@ const UserMessageComponent = ({
 			chatThreadsService.setCurrentlyFocusedMessageIdx(undefined);
 
 			// stream the edit
-			const userMessage = textAreaRefState.value;
+			const userMessage = getContentFromEditable(textAreaRefState);
+			const displayUserMessage = getDisplayTextFromEditable(textAreaRefState);
 			try {
 				await chatThreadsService.editUserMessageAndStreamResponse({
 					userMessage,
+					displayUserMessage,
 					messageIdx,
 					threadId,
 				});
@@ -1517,7 +1546,7 @@ const UserMessageComponent = ({
 			await chatThreadsService.abortRunning(threadId);
 		};
 
-		const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+		const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
 			if (e.key === "Escape") {
 				onCloseEdit();
 			}
@@ -3870,7 +3899,7 @@ const EditToolSoFar = ({
 };
 
 export const SidebarChat = () => {
-	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+	const textAreaRef = useRef<HTMLDivElement | null>(null);
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null);
 
 	const accessor = useAccessor();
@@ -3922,11 +3951,15 @@ export const SidebarChat = () => {
 			const threadId = chatThreadsService.state.currentThreadId;
 
 			// send message to LLM
-			const userMessage = _forceSubmit || textAreaRef.current?.value || "";
+			const userMessage =
+				_forceSubmit || getContentFromEditable(textAreaRef.current) || "";
+			const displayUserMessage =
+				_forceSubmit || getDisplayTextFromEditable(textAreaRef.current) || "";
 
 			try {
 				await chatThreadsService.addUserMessageAndStreamResponse({
 					userMessage,
+					displayUserMessage,
 					threadId,
 				});
 			} catch (e) {
@@ -4085,7 +4118,7 @@ export const SidebarChat = () => {
 		[setInstructionsAreEmpty],
 	);
 	const onKeyDown = useCallback(
-		(e: KeyboardEvent<HTMLTextAreaElement>) => {
+		(e: KeyboardEvent<HTMLDivElement>) => {
 			if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 				onSubmit();
 			} else if (e.key === "Escape" && isRunning) {

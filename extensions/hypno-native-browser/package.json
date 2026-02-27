@@ -15,7 +15,7 @@
     "commands": [
       {
         "command": "hypno.openBrowser",
-        "title": "Hypno: Open Native Browser"
+        "title": "Hypno: Open Browser"
       }
     ]
   },

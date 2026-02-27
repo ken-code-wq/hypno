@@ -414,10 +414,279 @@ const getOptionsAtPath = async (
 	return optionsAtPath;
 };
 
+// Serializes a contentEditable div's content, expanding DOM pills into their hidden payload.
+export const getContentFromEditable = (el: HTMLDivElement | null): string => {
+	if (!el) return "";
+	const parts: string[] = [];
+	const walk = (node: Node) => {
+		if (node.nodeType === Node.TEXT_NODE) {
+			parts.push(node.textContent || "");
+		} else if (node.nodeType === Node.ELEMENT_NODE) {
+			const elem = node as HTMLElement;
+			if (elem.hasAttribute("data-dom-pill")) {
+				// Expand pill into its hidden content for the LLM
+				const content = elem.getAttribute("data-pill-content") || "";
+				parts.push(content);
+			} else if (elem.tagName === "BR") {
+				parts.push("\n");
+			} else if (elem.tagName === "DIV" && elem !== el) {
+				// contentEditable wraps new lines in <div> elements
+				if (parts.length > 0 && parts[parts.length - 1] !== "\n") {
+					parts.push("\n");
+				}
+				elem.childNodes.forEach(walk);
+			} else {
+				elem.childNodes.forEach(walk);
+			}
+		}
+	};
+	el.childNodes.forEach(walk);
+	return parts.join("");
+};
+
+// Gets the visible (display) text from the contentEditable, NOT expanding pills.
+export const getDisplayTextFromEditable = (
+	el: HTMLDivElement | null,
+): string => {
+	if (!el) return "";
+	return el.textContent || "";
+};
+
+type PillKind = "file-mention" | "alt-click-context";
+
+const inferPillKind = (label: string, hiddenContent: string): PillKind => {
+	if (hiddenContent.trim().startsWith("@") || label.trim().startsWith("@")) {
+		return "file-mention";
+	}
+	return "alt-click-context";
+};
+
+const createPillIconElement = (kind: PillKind): SVGSVGElement => {
+	const svgNs = "http://www.w3.org/2000/svg";
+	const svg = document.createElementNS(svgNs, "svg");
+	svg.setAttribute("width", "12");
+	svg.setAttribute("height", "12");
+	svg.setAttribute("viewBox", "0 0 24 24");
+	svg.setAttribute("fill", "none");
+	svg.setAttribute("stroke", "currentColor");
+	svg.setAttribute("stroke-width", "2");
+	svg.setAttribute("stroke-linecap", "round");
+	svg.setAttribute("stroke-linejoin", "round");
+	svg.style.flexShrink = "0";
+	svg.style.opacity = "0.9";
+
+	if (kind === "file-mention") {
+		const outlinePath = document.createElementNS(svgNs, "path");
+		outlinePath.setAttribute(
+			"d",
+			"M7 3h7l5 5v12a1 1 0 0 1-1 1H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z",
+		);
+		const foldPath = document.createElementNS(svgNs, "path");
+		foldPath.setAttribute("d", "M14 3v5h5");
+		svg.appendChild(outlinePath);
+		svg.appendChild(foldPath);
+		return svg;
+	}
+
+	const pointerPath = document.createElementNS(svgNs, "path");
+	pointerPath.setAttribute("d", "M6 3 18 10l-5 2 2 6-2 1-2-6-5 3z");
+	const clickPath = document.createElementNS(svgNs, "path");
+	clickPath.setAttribute("d", "M16 4v2M19 6l-1.5 1.5M20 10h-2");
+	svg.appendChild(pointerPath);
+	svg.appendChild(clickPath);
+	return svg;
+};
+
+// Creates a DOM pill span element.
+const createPillElement = (
+	label: string,
+	hiddenContent: string,
+	kind?: PillKind,
+): HTMLSpanElement => {
+	const pillKind = kind ?? inferPillKind(label, hiddenContent);
+	const tooltipText = (hiddenContent || label).trim();
+
+	const pill = document.createElement("span");
+	pill.contentEditable = "false";
+	pill.setAttribute("data-dom-pill", "true");
+	pill.setAttribute("data-pill-content", hiddenContent);
+
+	if (tooltipText) {
+		pill.setAttribute("data-tooltip-id", "void-tooltip");
+		pill.setAttribute("data-tooltip-content", tooltipText);
+		pill.setAttribute("data-tooltip-place", "top");
+		pill.setAttribute("data-tooltip-delay-show", "120");
+		pill.setAttribute("title", tooltipText);
+	}
+
+	pill.style.cssText = [
+		"background: color-mix(in srgb, #dbeafe 55%, var(--vscode-editor-background) 45%)",
+		"color: color-mix(in srgb, #3366ad 82%, var(--vscode-editor-foreground) 18%)",
+		"border: 1px solid color-mix(in srgb, #bfd5f7 70%, var(--vscode-editor-background) 30%)",
+		"border-radius: 999px",
+		"line-height: 1.35",
+		"vertical-align: middle",
+		"user-select: none",
+		"display: inline-flex",
+		"align-items: center",
+		"gap: 6px",
+		"padding: 2px 10px",
+		"margin: 0 2px",
+		"font-size: 11px",
+		"font-weight: 500",
+		"cursor: default",
+	].join("; ");
+
+	pill.appendChild(createPillIconElement(pillKind));
+	const text = document.createElement("span");
+	text.textContent = label;
+	pill.appendChild(text);
+
+	return pill;
+};
+
+const isDomPillElement = (
+	node: Node | null | undefined,
+): node is HTMLSpanElement => {
+	return (
+		!!node &&
+		node.nodeType === Node.ELEMENT_NODE &&
+		(node as HTMLElement).hasAttribute("data-dom-pill")
+	);
+};
+
+const isWhitespaceTextNode = (node: Node | null | undefined): node is Text => {
+	return (
+		!!node &&
+		node.nodeType === Node.TEXT_NODE &&
+		!((node.textContent || "").trim().length > 0)
+	);
+};
+
+const findPillBeforeCaret = (range: Range): HTMLSpanElement | null => {
+	const { startContainer, startOffset } = range;
+
+	if (startContainer.nodeType === Node.TEXT_NODE) {
+		const textNode = startContainer as Text;
+		if (startOffset === 0) {
+			return isDomPillElement(textNode.previousSibling)
+				? textNode.previousSibling
+				: null;
+		}
+		const textBefore = (textNode.textContent || "").slice(0, startOffset);
+		return /^\s*$/.test(textBefore) && isDomPillElement(textNode.previousSibling)
+			? textNode.previousSibling
+			: null;
+	}
+
+	const element = startContainer as Element;
+	const immediateLeft = element.childNodes[startOffset - 1] ?? null;
+	if (isDomPillElement(immediateLeft)) return immediateLeft;
+	if (
+		isWhitespaceTextNode(immediateLeft) &&
+		isDomPillElement(immediateLeft.previousSibling)
+	) {
+		return immediateLeft.previousSibling;
+	}
+	return null;
+};
+
+const findPillAfterCaret = (range: Range): HTMLSpanElement | null => {
+	const { startContainer, startOffset } = range;
+
+	if (startContainer.nodeType === Node.TEXT_NODE) {
+		const textNode = startContainer as Text;
+		const textAfter = (textNode.textContent || "").slice(startOffset);
+		return /^\s*$/.test(textAfter) && isDomPillElement(textNode.nextSibling)
+			? textNode.nextSibling
+			: null;
+	}
+
+	const element = startContainer as Element;
+	const immediateRight = element.childNodes[startOffset] ?? null;
+	if (isDomPillElement(immediateRight)) return immediateRight;
+	if (
+		isWhitespaceTextNode(immediateRight) &&
+		isDomPillElement(immediateRight.nextSibling)
+	) {
+		return immediateRight.nextSibling;
+	}
+	return null;
+};
+
+const removePillElement = (
+	pill: HTMLSpanElement,
+	editable: HTMLDivElement,
+): void => {
+	const previousSibling = pill.previousSibling;
+	const nextSibling = pill.nextSibling;
+
+	let cursorAnchorNode: Node | null = null;
+	let cursorAnchorOffset = 0;
+
+	if (isWhitespaceTextNode(nextSibling)) {
+		nextSibling.textContent = (nextSibling.textContent || "").replace(/^ /, "");
+		if (!nextSibling.textContent) {
+			nextSibling.remove();
+		}
+		if (nextSibling.isConnected) {
+			cursorAnchorNode = nextSibling;
+			cursorAnchorOffset = 0;
+		}
+	} else if (isWhitespaceTextNode(previousSibling)) {
+		previousSibling.textContent = (previousSibling.textContent || "").replace(
+			/ $/,
+			"",
+		);
+		if (!previousSibling.textContent) {
+			previousSibling.remove();
+		}
+		if (previousSibling.isConnected) {
+			cursorAnchorNode = previousSibling;
+			cursorAnchorOffset = previousSibling.textContent?.length || 0;
+		}
+	} else if (nextSibling) {
+		cursorAnchorNode = nextSibling;
+		cursorAnchorOffset = 0;
+	} else if (previousSibling) {
+		cursorAnchorNode = previousSibling;
+		cursorAnchorOffset =
+			previousSibling.nodeType === Node.TEXT_NODE
+				? previousSibling.textContent?.length || 0
+				: previousSibling.childNodes.length;
+	}
+
+	pill.remove();
+
+	const selection = window.getSelection();
+	if (!selection) return;
+	const nextRange = document.createRange();
+	if (cursorAnchorNode && editable.contains(cursorAnchorNode)) {
+		if (cursorAnchorNode.nodeType === Node.TEXT_NODE) {
+			nextRange.setStart(
+				cursorAnchorNode,
+				Math.min(
+					cursorAnchorOffset,
+					(cursorAnchorNode.textContent || "").length,
+				),
+			);
+		} else {
+			nextRange.setStartBefore(cursorAnchorNode);
+		}
+	} else {
+		nextRange.selectNodeContents(editable);
+		nextRange.collapse(false);
+	}
+	nextRange.collapse(true);
+	selection.removeAllRanges();
+	selection.addRange(nextRange);
+};
+
 export type TextAreaFns = {
 	setValue: (v: string) => void;
 	enable: () => void;
 	disable: () => void;
+	insertPill?: (label: string, hiddenContent: string, kind?: PillKind) => void;
 };
 type InputBox2Props = {
 	initValue?: string | null;
@@ -427,12 +696,12 @@ type InputBox2Props = {
 	fnsRef?: { current: null | TextAreaFns };
 	className?: string;
 	onChangeText?: (value: string) => void;
-	onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
-	onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
-	onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
+	onKeyDown?: (e: React.KeyboardEvent<HTMLDivElement>) => void;
+	onFocus?: (e: React.FocusEvent<HTMLDivElement>) => void;
+	onBlur?: (e: React.FocusEvent<HTMLDivElement>) => void;
 	onChangeHeight?: (newHeight: number) => void;
 };
-export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
+export const VoidInputBox2 = forwardRef<HTMLDivElement, InputBox2Props>(
 	function X(
 		{
 			initValue,
@@ -454,7 +723,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 		const chatThreadService = accessor.get("IChatThreadService");
 		const languageService = accessor.get("ILanguageService");
 
-		const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+		const textAreaRef = useRef<HTMLDivElement | null>(null);
 		const selectedOptionRef = useRef<HTMLDivElement>(null);
 		const [isMenuOpen, _setIsMenuOpen] = useState(false); // the @ to mention menu
 		const setIsMenuOpen: typeof _setIsMenuOpen = (value) => {
@@ -479,34 +748,106 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 			optionPath.length === 0 && !optionText ? false : true;
 
 		const insertTextAtCursor = (text: string) => {
-			const textarea = textAreaRef.current;
-			if (!textarea) return;
+			const editable = textAreaRef.current;
+			if (!editable) return;
 
-			// Focus the textarea first
-			textarea.focus();
+			editable.focus();
 
-			// Get cursor position
-			const startPos = textarea.selectionStart;
-			const endPos = textarea.selectionEnd;
+			const sel = window.getSelection();
+			if (!sel || sel.rangeCount === 0) return;
 
-			// Get the text before the cursor, excluding the @ symbol that triggered the menu
-			const textBeforeCursor = textarea.value.substring(0, startPos - 1);
-			const textAfterCursor = textarea.value.substring(endPos);
+			const range = sel.getRangeAt(0);
 
-			// Insert the file reference inline (text should include the @ prefix)
-			// Add a trailing space for better UX
-			const insertText = text + " ";
-			textarea.value = textBeforeCursor + insertText + textAfterCursor;
-
-			// Set cursor position after the inserted text
-			const newCursorPos = textBeforeCursor.length + insertText.length;
-			textarea.setSelectionRange(newCursorPos, newCursorPos);
-
-			// React's onChange relies on a SyntheticEvent system
-			// The best way to ensure it runs is to call callbacks directly
-			if (onChangeText) {
-				onChangeText(textarea.value);
+			// Walk backward to find and remove the @ trigger character
+			const startContainer = range.startContainer;
+			if (startContainer.nodeType === Node.TEXT_NODE && range.startOffset > 0) {
+				const textNode = startContainer as Text;
+				const textBefore =
+					textNode.textContent?.substring(0, range.startOffset) || "";
+				if (textBefore.endsWith("@")) {
+					textNode.textContent =
+						textBefore.slice(0, -1) +
+						textNode.textContent!.substring(range.startOffset);
+					range.setStart(textNode, range.startOffset - 1);
+					range.collapse(true);
+				}
 			}
+
+			// Insert the text with a trailing space
+			const insertText = text + " ";
+			const textNode = document.createTextNode(insertText);
+			range.deleteContents();
+			range.insertNode(textNode);
+
+			// Move cursor after inserted text
+			range.setStartAfter(textNode);
+			range.collapse(true);
+			sel.removeAllRanges();
+			sel.addRange(range);
+
+			if (onChangeText) {
+				onChangeText(getContentFromEditable(editable));
+			}
+			adjustHeight();
+		};
+
+		const insertPillAtCursor = (
+			label: string,
+			hiddenContent: string,
+			kind: PillKind = "alt-click-context",
+			removeAtTrigger = false,
+		) => {
+			const editable = textAreaRef.current;
+			if (!editable) return;
+
+			editable.focus();
+
+			const sel = window.getSelection();
+			if (!sel || sel.rangeCount === 0) {
+				// No selection, place at end
+				const pill = createPillElement(label, hiddenContent, kind);
+				const space = document.createTextNode(" ");
+				editable.appendChild(pill);
+				editable.appendChild(space);
+				// Move cursor after — re-acquire selection since focus() may have created one
+				const newSel = window.getSelection();
+				if (newSel) {
+					const newRange = document.createRange();
+					newRange.setStartAfter(space);
+					newRange.collapse(true);
+					newSel.removeAllRanges();
+					newSel.addRange(newRange);
+				}
+			} else {
+				const range = sel.getRangeAt(0);
+				if (removeAtTrigger && range.startContainer.nodeType === Node.TEXT_NODE) {
+					const textNode = range.startContainer as Text;
+					const textBefore =
+						textNode.textContent?.substring(0, range.startOffset) || "";
+					if (textBefore.endsWith("@")) {
+						textNode.textContent =
+							textBefore.slice(0, -1) +
+							textNode.textContent!.substring(range.startOffset);
+						range.setStart(textNode, Math.max(0, range.startOffset - 1));
+						range.collapse(true);
+					}
+				}
+				range.deleteContents();
+				const pill = createPillElement(label, hiddenContent, kind);
+				const space = document.createTextNode(" ");
+				range.insertNode(space);
+				range.insertNode(pill);
+				// Move cursor after the space
+				range.setStartAfter(space);
+				range.collapse(true);
+				sel.removeAllRanges();
+				sel.addRange(range);
+			}
+
+			if (onChangeText) {
+				onChangeText(getContentFromEditable(editable));
+			}
+			setShowPlaceholder(false);
 			adjustHeight();
 		};
 
@@ -521,8 +862,8 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 			setDidLoadInitialOptions(false);
 			if (isLastOption) {
 				setIsMenuOpen(false);
-				// Insert @filepath inline in the text (use abbreviatedName which is the basename)
-				insertTextAtCursor("@" + option.abbreviatedName);
+				const mentionToken = `@${option.abbreviatedName}`;
+				insertPillAtCursor(mentionToken, mentionToken, "file-mention", true);
 
 				let newSelection: StagingSelectionItem;
 				if (option.leafNodeType === "File")
@@ -617,6 +958,29 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 			setOptionIdx(options.length - 1);
 		};
 
+		// Listening for direct context injections from Void's backend
+		useEffect(() => {
+			const disposable = chatThreadService.onDidReceiveContext((context) => {
+				if (context.text) {
+					insertTextAtCursor(context.text);
+				}
+				if (context.domElement) {
+					insertPillAtCursor(
+						context.domElement.label,
+						context.domElement.content,
+						"alt-click-context",
+					);
+				}
+				if (context.imageUri) {
+					chatThreadService.addNewStagingSelection({
+						type: "Image",
+						dataURI: context.imageUri,
+					});
+				}
+			});
+			return () => disposable.dispose();
+		}, [chatThreadService]);
+
 		const debounceTimerRef = useRef<number | null>(null);
 
 		useEffect(() => {
@@ -662,7 +1026,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 			[optionPath, accessor],
 		);
 
-		const onMenuKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+		const onMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
 			const isCommandKeyPressed = e.altKey || e.ctrlKey || e.metaKey;
 
 			if (e.key === "ArrowUp") {
@@ -799,6 +1163,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 		// logic for @ to mention ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 		const [isEnabled, setEnabled] = useState(true);
+		const [showPlaceholder, setShowPlaceholder] = useState(true);
 
 		const adjustHeight = useCallback(() => {
 			const r = textAreaRef.current;
@@ -812,13 +1177,30 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 			r.style.height = `${newHeight}px`;
 		}, []);
 
+		const syncEditableState = useCallback(() => {
+			const r = textAreaRef.current;
+			if (!r) return;
+			const hasContent =
+				!!getDisplayTextFromEditable(r).trim() ||
+				r.querySelector("[data-dom-pill]") !== null;
+			setShowPlaceholder(!hasContent);
+			onChangeText?.(getContentFromEditable(r));
+			adjustHeight();
+		}, [onChangeText, adjustHeight]);
+
 		const fns: TextAreaFns = useMemo(
 			() => ({
 				setValue: (val) => {
 					const r = textAreaRef.current;
 					if (!r) return;
-					r.value = val;
-					onChangeText?.(r.value);
+					if (val) {
+						r.textContent = val;
+						setShowPlaceholder(false);
+					} else {
+						r.innerHTML = "";
+						setShowPlaceholder(true);
+					}
+					onChangeText?.(getContentFromEditable(r));
 					adjustHeight();
 				},
 				enable: () => {
@@ -827,8 +1209,11 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 				disable: () => {
 					setEnabled(false);
 				},
+				insertPill: (label: string, hiddenContent: string, kind?: PillKind) => {
+					insertPillAtCursor(label, hiddenContent, kind ?? "alt-click-context");
+				},
 			}),
-			[onChangeText, adjustHeight],
+			[onChangeText, adjustHeight, insertPillAtCursor],
 		);
 
 		useEffect(() => {
@@ -837,89 +1222,157 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(
 
 		return (
 			<>
-				<textarea
-					autoFocus={false}
-					ref={useCallback(
-						(r: HTMLTextAreaElement | null) => {
-							if (fnsRef) fnsRef.current = fns;
-
-							refs.setReference(r);
-
-							textAreaRef.current = r;
-							if (typeof ref === "function") ref(r);
-							else if (ref) ref.current = r;
-							adjustHeight();
-						},
-						[fnsRef, fns, setEnabled, adjustHeight, ref, refs],
+				<div style={{ position: "relative" }}>
+					{/* Placeholder overlay */}
+					{showPlaceholder && (
+						<div
+							style={{
+								position: "absolute",
+								top: 0,
+								left: 0,
+								right: 0,
+								pointerEvents: "none",
+								padding: "inherit",
+							}}
+							className="text-void-fg-3 select-none"
+						>
+							{placeholder}
+						</div>
 					)}
-					onFocus={onFocus}
-					onBlur={onBlur}
-					disabled={!isEnabled}
-					className={`w-full resize-none max-h-[500px] overflow-y-auto text-void-fg-1 placeholder:text-void-fg-3 ${className}`}
-					style={{
-						// defaultInputBoxStyles
-						background: asCssVariable(inputBackground),
-						color: asCssVariable(inputForeground),
-						// inputBorder: asCssVariable(inputBorder),
-					}}
-					onInput={useCallback(
-						(event: React.FormEvent<HTMLTextAreaElement>) => {
-							const latestChange = (event.nativeEvent as InputEvent).data;
+					<div
+						role="textbox"
+						contentEditable={isEnabled}
+						suppressContentEditableWarning
+						ref={useCallback(
+							(r: HTMLDivElement | null) => {
+								if (fnsRef) fnsRef.current = fns;
 
-							if (latestChange === "@") {
-								onOpenOptionMenu();
-							}
-						},
-						[onOpenOptionMenu, accessor],
-					)}
-					onChange={useCallback(
-						(e: React.ChangeEvent<HTMLTextAreaElement>) => {
-							const r = textAreaRef.current;
-							if (!r) return;
-							onChangeText?.(r.value);
-							adjustHeight();
-						},
-						[onChangeText, adjustHeight],
-					)}
-					onKeyDown={useCallback(
-						(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-							if (isMenuOpen) {
-								onMenuKeyDown(e);
-								return;
-							}
+								refs.setReference(r);
 
-							if (e.key === "Backspace") {
-								// TODO allow user to undo this.
-								if (
-									!e.currentTarget.value ||
-									(e.currentTarget.selectionStart === 0 &&
-										e.currentTarget.selectionEnd === 0)
-								) {
-									// if there is no text or cursor is at position 0, remove a selection
-									if (e.metaKey || e.ctrlKey) {
-										// Ctrl+Backspace = remove all
-										chatThreadService.popStagingSelections(
-											Number.MAX_SAFE_INTEGER,
-										);
-									} else {
-										// Backspace = pop 1 selection
-										chatThreadService.popStagingSelections(1);
-									}
+								textAreaRef.current = r;
+								if (typeof ref === "function") ref(r);
+								else if (ref) ref.current = r;
+								adjustHeight();
+							},
+							[fnsRef, fns, setEnabled, adjustHeight, ref, refs],
+						)}
+						onFocus={onFocus as any}
+						onBlur={onBlur as any}
+						className={`w-full resize-none max-h-[500px] overflow-y-auto text-void-fg-1 outline-none whitespace-pre-wrap break-words ${className}`}
+						style={{
+							background: asCssVariable(inputBackground),
+							color: asCssVariable(inputForeground),
+							minHeight: "1.5em",
+						}}
+						onMouseDown={useCallback(
+							(e: React.MouseEvent<HTMLDivElement>) => {
+								const r = textAreaRef.current;
+								if (!r) return;
+								const target = e.target as HTMLElement | null;
+								const pill = target?.closest?.(
+									"[data-dom-pill]",
+								) as HTMLSpanElement | null;
+								if (!pill || !r.contains(pill)) return;
+								e.preventDefault();
+								e.stopPropagation();
+								removePillElement(pill, r);
+								syncEditableState();
+								r.focus();
+							},
+							[syncEditableState],
+						)}
+						onInput={useCallback(
+							(event: React.FormEvent<HTMLDivElement>) => {
+								const r = textAreaRef.current;
+								if (!r) return;
+
+								const latestChange = (event.nativeEvent as InputEvent).data;
+								if (latestChange === "@") {
+									onOpenOptionMenu();
+								}
+
+								syncEditableState();
+							},
+							[onOpenOptionMenu, syncEditableState],
+						)}
+						onKeyDown={useCallback(
+							(e: React.KeyboardEvent<HTMLDivElement>) => {
+								if (isMenuOpen) {
+									onMenuKeyDown(e as any);
 									return;
 								}
+
+								if (e.key === "Backspace" || e.key === "Delete") {
+									const r = textAreaRef.current;
+									const sel = window.getSelection();
+									if (
+										r &&
+										sel &&
+										sel.rangeCount > 0 &&
+										sel.isCollapsed
+									) {
+										const range = sel.getRangeAt(0);
+										const pillToRemove =
+											e.key === "Backspace"
+												? findPillBeforeCaret(range)
+												: findPillAfterCaret(range);
+										if (pillToRemove && r.contains(pillToRemove)) {
+											e.preventDefault();
+											removePillElement(pillToRemove, r);
+											syncEditableState();
+											return;
+										}
+									}
+								}
+
+								if (e.key === "Backspace") {
+									const r = textAreaRef.current;
+									const isEmpty =
+										r &&
+										!getDisplayTextFromEditable(r).trim() &&
+										!r.querySelector("[data-dom-pill]");
+									const sel = window.getSelection();
+									const isAtStart =
+										sel &&
+										sel.rangeCount > 0 &&
+										sel.getRangeAt(0).startOffset === 0 &&
+										sel.getRangeAt(0).startContainer === r;
+									if (isEmpty || isAtStart) {
+										if (e.metaKey || e.ctrlKey) {
+											chatThreadService.popStagingSelections(
+												Number.MAX_SAFE_INTEGER,
+											);
+										} else {
+											chatThreadService.popStagingSelections(1);
+										}
+										return;
+									}
+								}
+								if (e.key === "Enter") {
+									const shouldAddNewline = e.shiftKey && multiline;
+									if (!shouldAddNewline) e.preventDefault();
+								}
+								onKeyDown?.(e);
+							},
+							[
+								onKeyDown,
+								onMenuKeyDown,
+								multiline,
+								isMenuOpen,
+								chatThreadService,
+								syncEditableState,
+							],
+						)}
+						onPaste={useCallback((e: React.ClipboardEvent<HTMLDivElement>) => {
+							// Paste as plain text to avoid formatting
+							e.preventDefault();
+							const text = e.clipboardData.getData("text/plain");
+							if (text) {
+								document.execCommand("insertText", false, text);
 							}
-							if (e.key === "Enter") {
-								// Shift + Enter when multiline = newline
-								const shouldAddNewline = e.shiftKey && multiline;
-								if (!shouldAddNewline) e.preventDefault(); // prevent newline from being created
-							}
-							onKeyDown?.(e);
-						},
-						[onKeyDown, onMenuKeyDown, multiline],
-					)}
-					rows={1}
-					placeholder={placeholder}
-				/>
+						}, [])}
+					/>
+				</div>
 				{/* <div>{`idx ${optionIdx}`}</div> */}
 				{isMenuOpen && (
 					<div

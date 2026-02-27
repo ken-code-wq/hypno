@@ -1,12 +1,30 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 let isInspectMode = false;
+let isAltPreviewMode = false;
 let inspectStyle = null;
 let overlayWrapper = null;
 let overlayBox = null;
 let overlayBadge = null;
 let hoveredElement = null;
 let isTrackingMouse = false;
+
+function isOverlayActive() {
+	return isInspectMode || isAltPreviewMode;
+}
+
+function syncOverlayTracking() {
+	if (isOverlayActive()) {
+		createOverlay();
+		window.addEventListener('mousemove', onMouseMove, { capture: true, passive: true });
+		return;
+	}
+
+	hoveredElement = null;
+	isTrackingMouse = false;
+	window.removeEventListener('mousemove', onMouseMove, { capture: true });
+	removeOverlay();
+}
 
 function createOverlay() {
 	if (overlayWrapper) return;
@@ -88,7 +106,7 @@ function removeOverlay() {
 }
 
 function updateOverlayPosition(clientX, clientY) {
-	if (!isInspectMode || !overlayWrapper) {
+	if (!isOverlayActive() || !overlayWrapper) {
 		isTrackingMouse = false;
 		return;
 	}
@@ -121,15 +139,15 @@ function updateOverlayPosition(clientX, clientY) {
 	isTrackingMouse = false;
 }
 
-const onMouseMove = (e) => {
-	if (!isInspectMode) return;
+function onMouseMove(e) {
+	if (!isOverlayActive()) return;
 	if (!isTrackingMouse) {
 		isTrackingMouse = true;
 		const clientX = e.clientX;
 		const clientY = e.clientY;
 		requestAnimationFrame(() => updateOverlayPosition(clientX, clientY));
 	}
-};
+}
 
 ipcRenderer.on('hypno-toggle-inspect', () => {
 	isInspectMode = !isInspectMode;
@@ -137,23 +155,44 @@ ipcRenderer.on('hypno-toggle-inspect', () => {
 		inspectStyle = document.createElement('style');
 		inspectStyle.textContent = '* { cursor: crosshair !important; }';
 		document.head.appendChild(inspectStyle);
-		createOverlay();
-		window.addEventListener('mousemove', onMouseMove, { capture: true, passive: true });
+		syncOverlayTracking();
 	} else {
-		if (inspectStyle) inspectStyle.remove();
-		removeOverlay();
-		window.removeEventListener('mousemove', onMouseMove, { capture: true });
+		if (inspectStyle) {
+			inspectStyle.remove();
+			inspectStyle = null;
+		}
+		syncOverlayTracking();
 	}
 });
 
 window.addEventListener('keydown', (e) => {
+	if (e.key === 'Alt' && !isAltPreviewMode) {
+		isAltPreviewMode = true;
+		syncOverlayTracking();
+		return;
+	}
+
 	if (e.key === 'Escape' && isInspectMode) {
 		isInspectMode = false;
-		if (inspectStyle) inspectStyle.remove();
-		removeOverlay();
-		window.removeEventListener('mousemove', onMouseMove, { capture: true });
+		if (inspectStyle) {
+			inspectStyle.remove();
+			inspectStyle = null;
+		}
+		syncOverlayTracking();
 		ipcRenderer.send('vscode:hypno-browser-inspect-disabled');
 	}
+});
+
+window.addEventListener('keyup', (e) => {
+	if (e.key !== 'Alt' || !isAltPreviewMode) return;
+	isAltPreviewMode = false;
+	syncOverlayTracking();
+});
+
+window.addEventListener('blur', () => {
+	if (!isAltPreviewMode) return;
+	isAltPreviewMode = false;
+	syncOverlayTracking();
 });
 
 // Phase 2: The Cleaner Recursive Function
@@ -221,6 +260,156 @@ function getRelevantStyles(el) {
 	return relevant;
 }
 
+function getJavascriptContext(el) {
+	const inlineHandlers = [];
+	const frameworkHandlers = [];
+
+	for (const attr of Array.from(el.attributes || [])) {
+		if (attr.name.startsWith('on') && attr.value && attr.value.trim().length > 0) {
+			inlineHandlers.push(`${attr.name}="${attr.value.trim()}"`);
+		}
+	}
+
+	try {
+		const reactPropsKey = Object.keys(el).find((key) => key.startsWith('__reactProps$'));
+		if (reactPropsKey) {
+			const reactProps = el[reactPropsKey];
+			if (reactProps && typeof reactProps === 'object') {
+				for (const [key, value] of Object.entries(reactProps)) {
+					if (key.startsWith('on') && typeof value === 'function') {
+						frameworkHandlers.push(`React.${key}`);
+					}
+				}
+			}
+		}
+	} catch {
+		// Ignore framework internals that throw during reflective access.
+	}
+
+	if (Object.keys(el).some((key) => key.startsWith('__vueParentComponent'))) {
+		frameworkHandlers.push('Vue component context detected');
+	}
+
+	const scriptUrls = Array.from(document.querySelectorAll('script[src]'))
+		.map((script) => script.getAttribute('src'))
+		.filter((src) => typeof src === 'string' && src.length > 0)
+		.slice(0, 8);
+
+	const lines = [];
+	if (inlineHandlers.length > 0) {
+		lines.push(`Inline handlers: ${inlineHandlers.join(', ')}`);
+	}
+	if (frameworkHandlers.length > 0) {
+		lines.push(`Framework handlers: ${frameworkHandlers.join(', ')}`);
+	}
+	if (scriptUrls.length > 0) {
+		lines.push('Page scripts:');
+		for (const src of scriptUrls) {
+			lines.push(`- ${src}`);
+		}
+	}
+
+	return lines.join('\n');
+}
+
+function getElementAttributes(el) {
+	const attrs = {};
+	const prioritized = new Set([
+		'id',
+		'class',
+		'href',
+		'src',
+		'alt',
+		'role',
+		'name',
+		'type',
+		'value',
+		'aria-label',
+		'title'
+	]);
+
+	for (const attr of Array.from(el.attributes || [])) {
+		const key = attr.name;
+		const value = attr.value ? attr.value.trim() : '';
+		if (!value) continue;
+
+		if (prioritized.has(key) || key.startsWith('data-') || key.startsWith('aria-')) {
+			attrs[key] = value;
+		}
+
+		if (Object.keys(attrs).length >= 14) {
+			break;
+		}
+	}
+
+	return attrs;
+}
+
+function getDomPath(element, maxDepth = 7) {
+	if (!(element instanceof Element)) return '';
+
+	const parts = [];
+	let current = element;
+
+	while (current && parts.length < maxDepth) {
+		let part = current.tagName.toLowerCase();
+		if (current.id) {
+			part += `#${current.id}`;
+		} else if (typeof current.className === 'string' && current.className.trim()) {
+			const classPart = current.className.trim().split(/\s+/)[0];
+			if (classPart) {
+				part += `.${classPart}`;
+			}
+		}
+		parts.unshift(part);
+
+		if (current.parentElement && current.parentElement.children) {
+			const siblings = Array.from(current.parentElement.children).filter(
+				sibling => sibling.tagName === current.tagName
+			);
+			if (siblings.length > 1) {
+				const index = siblings.indexOf(current) + 1;
+				if (index > 0) {
+					parts[0] += `[${index}]`;
+				}
+			}
+		}
+
+		current = current.parentElement;
+	}
+
+	return parts.join(' > ');
+}
+
+function getInnerTextPreview(el) {
+	const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+	if (!text) return '';
+	return text.length > 420 ? `${text.slice(0, 420)}...` : text;
+}
+
+function getXPath(element) {
+	if (!element || element.nodeType !== Node.ELEMENT_NODE) return '';
+	if (element.id !== '') {
+		return `//*[@id='${element.id}']`;
+	}
+	if (element === document.body) {
+		return '/html/body';
+	}
+	let ix = 0;
+	const siblings = element.parentNode ? element.parentNode.childNodes : [];
+	for (let i = 0; i < siblings.length; i++) {
+		const sibling = siblings[i];
+		if (sibling === element) {
+			const parentPath = getXPath(element.parentNode);
+			return `${parentPath}/${element.tagName.toLowerCase()}['${ix + 1}']`;
+		}
+		if (sibling.nodeType === Node.ELEMENT_NODE && sibling.tagName === element.tagName) {
+			ix++;
+		}
+	}
+	return '';
+}
+
 const blockEvent = (e) => {
 	if ((e.altKey && e.button === 0) || (isInspectMode && e.button === 0)) {
 		e.preventDefault();
@@ -244,28 +433,47 @@ window.addEventListener('click', (e) => {
 
 		if (isInspectMode) {
 			isInspectMode = false;
-			if (inspectStyle) inspectStyle.remove();
-			removeOverlay();
-			window.removeEventListener('mousemove', onMouseMove, { capture: true });
+			if (inspectStyle) {
+				inspectStyle.remove();
+				inspectStyle = null;
+			}
+			syncOverlayTracking();
 			ipcRenderer.send('vscode:hypno-browser-inspect-disabled');
 		}
 
 		const el = e.target;
-		if (!el) return;
+		if (!(el instanceof Element)) return;
 
 		// Extract a clean version of the target element
 		const cleanedClone = cleanElement(el);
 		let html = cleanedClone ? cleanedClone.outerHTML : '';
 
+		const rawCss = getRelevantStyles(el);
+		const cssString = Object.entries(rawCss).map(([k, v]) => `${k}: ${v};`).join(' ');
+		const rect = el.getBoundingClientRect();
+
 		const data = {
-			html: html,
-			css: getRelevantStyles(el),
 			tagName: el.tagName.toLowerCase(),
+			className: typeof el.className === 'string' ? el.className.trim() : '',
 			id: el.id || '',
-			className: el.className && typeof el.className === 'string' ? el.className.trim() : '',
-			url: window.location.href
+			domPath: getDomPath(el),
+			xpath: getXPath(el),
+			attributes: getElementAttributes(el),
+			cleanedHTML: html,
+			layoutCSS: cssString,
+			computedStyles: rawCss,
+			position: {
+				top: Math.round(rect.top * 100) / 100,
+				left: Math.round(rect.left * 100) / 100,
+				width: Math.round(rect.width * 100) / 100,
+				height: Math.round(rect.height * 100) / 100
+			},
+			innerText: getInnerTextPreview(el),
+			pageUrl: window.location.href,
+			pageTitle: document.title,
+			javascriptContext: getJavascriptContext(el)
 		};
 
-		ipcRenderer.send('vscode:hypno-browser-click', data);
+		ipcRenderer.send('hypno-browser-reference', data);
 	}
 }, { capture: true, passive: false });

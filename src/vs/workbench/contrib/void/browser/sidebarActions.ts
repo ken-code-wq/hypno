@@ -172,7 +172,7 @@ registerAction2(class extends Action2 {
 		const oldUI = await oldThread?.state.mountedInfo?.whenMounted
 
 		const oldSelns = oldThread?.state.stagingSelections
-		const oldVal = oldUI?.textAreaRef?.current?.value
+		const oldVal = oldUI?.textAreaRef?.current?.textContent
 
 		// open and focus new thread
 		chatThreadsService.openNewThread()
@@ -185,7 +185,7 @@ registerAction2(class extends Action2 {
 
 		const newUI = await newThread?.state.mountedInfo?.whenMounted
 		chatThreadsService.setCurrentThreadState({ stagingSelections: oldSelns, })
-		if (newUI?.textAreaRef?.current && oldVal) newUI.textAreaRef.current.value = oldVal
+		if (newUI?.textAreaRef?.current && oldVal) newUI.textAreaRef.current.textContent = oldVal
 
 
 		// if has selection, add it
@@ -248,6 +248,32 @@ registerAction2(class extends Action2 {
 	async run(accessor: ServicesAccessor): Promise<void> {
 		const commandService = accessor.get(ICommandService)
 		commandService.executeCommand(VOID_TOGGLE_SETTINGS_ACTION_ID)
+	}
+})
+
+
+// Direct Context Injection
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'void.addContext',
+			title: 'Void: Add Context',
+			f1: false, // Internal command only
+		});
+	}
+	async run(accessor: ServicesAccessor, args?: { text?: string, imageUri?: string, domElement?: { label: string, content: string } }): Promise<void> {
+		if (!args) return;
+		const chatThreadService = accessor.get(IChatThreadService);
+		const viewsService = accessor.get(IViewsService)
+
+		const wasAlreadyOpen = viewsService.isViewContainerVisible(VOID_VIEW_CONTAINER_ID)
+		if (!wasAlreadyOpen) {
+			const commandService = accessor.get(ICommandService)
+			await commandService.executeCommand(VOID_OPEN_SIDEBAR_ACTION_ID)
+		}
+
+		chatThreadService.addContext(args);
+		await chatThreadService.focusCurrentChat();
 	}
 })
 

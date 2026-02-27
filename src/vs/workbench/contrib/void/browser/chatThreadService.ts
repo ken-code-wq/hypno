@@ -52,6 +52,13 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 	for (let i = 0; i < currentSelections.length; i += 1) {
 		const s = currentSelections[i]
 
+		// Image items don't have a uri, match by type + dataURI
+		if (s.type === 'Image' && newSelection.type === 'Image') {
+			if (s.dataURI === newSelection.dataURI) return i
+			continue
+		}
+		if (s.type === 'Image' || newSelection.type === 'Image') continue
+
 		if (s.uri.fsPath !== newSelection.uri.fsPath) continue
 
 		if (s.type === 'File' && newSelection.type === 'File') {
@@ -105,7 +112,7 @@ const defaultMessageState: UserMessageState = {
 // a 'thread' means a chat message history
 
 type WhenMounted = {
-	textAreaRef: { current: HTMLTextAreaElement | null }; // the textarea that this thread has, gets set in SidebarChat
+	textAreaRef: { current: HTMLDivElement | null }; // the contentEditable div that this thread has, gets set in SidebarChat
 	scrollToBottom: () => void;
 }
 
@@ -277,10 +284,10 @@ export interface IChatThreadService {
 	dismissStreamError(threadId: string): void;
 
 	// call to edit a message
-	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
+	editUserMessageAndStreamResponse({ userMessage, displayUserMessage, messageIdx, threadId }: { userMessage: string, displayUserMessage?: string, messageIdx: number, threadId: string }): Promise<void>;
 
 	// call to add a message
-	addUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): Promise<void>;
+	addUserMessageAndStreamResponse({ userMessage, displayUserMessage, threadId }: { userMessage: string, displayUserMessage?: string, threadId: string }): Promise<void>;
 
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
@@ -291,6 +298,10 @@ export interface IChatThreadService {
 
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
+
+	// context injection (from Native Browser, etc.)
+	addContext(args: { text?: string, imageUri?: string, domElement?: { label: string, content: string } }): void;
+	onDidReceiveContext: Event<{ text?: string, imageUri?: string, domElement?: { label: string, content: string } }>;
 }
 
 export const IChatThreadService = createDecorator<IChatThreadService>('voidChatThreadService');
@@ -303,6 +314,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private readonly _onDidChangeStreamState = new Emitter<{ threadId: string }>();
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
+
+	private readonly _onDidReceiveContext = new Emitter<{ text?: string, imageUri?: string, domElement?: { label: string, content: string } }>();
+	readonly onDidReceiveContext: Event<{ text?: string, imageUri?: string, domElement?: { label: string, content: string } }> = this._onDidReceiveContext.event;
+
+	addContext(args: { text?: string, imageUri?: string, domElement?: { label: string, content: string } }): void {
+		this._onDidReceiveContext.fire(args);
+	}
 
 	readonly streamState: ThreadStreamState = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
@@ -1231,7 +1249,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, displayUserMessage, _chatSelections, threadId }: { userMessage: string, displayUserMessage?: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -1248,10 +1266,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		// add user's message to chat history
 		const instructions = userMessage
+		const displayInstructions = displayUserMessage ?? userMessage
 		const currSelns: StagingSelectionItem[] = _chatSelections ?? thread.state.stagingSelections
 
 		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
-		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
+		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: displayInstructions, selections: currSelns, state: defaultMessageState }
 		this._addMessageToThread(threadId, userHistoryElt)
 
 		this._setThreadState(threadId, { currCheckpointIdx: null }) // no longer at a checkpoint because started streaming
@@ -1268,7 +1287,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+	async addUserMessageAndStreamResponse({ userMessage, displayUserMessage, _chatSelections, threadId }: { userMessage: string, displayUserMessage?: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
 
@@ -1291,11 +1310,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 		}
 
 		// Now call the original method to add the user message and stream the response
-		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
+		await this._addUserMessageAndStreamResponse({ userMessage, displayUserMessage, _chatSelections, threadId });
 
 	}
 
-	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, messageIdx, threadId }) => {
+	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, displayUserMessage, messageIdx, threadId }) => {
 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -1320,7 +1339,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		})
 
 		// re-add the message and stream it
-		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId })
+		this._addUserMessageAndStreamResponse({ userMessage, displayUserMessage, _chatSelections: currSelns, threadId })
 	}
 
 	// ---------- the rest ----------
@@ -1341,7 +1360,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 			// URIs of user selections
 			if (m.role === 'user') {
 				for (const sel of m.selections ?? []) {
-					addURI(sel.uri)
+					if (sel.type !== 'Image') {
+						addURI(sel.uri)
+					}
 				}
 			}
 			// URIs of files that have been read

@@ -515,9 +515,9 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 			this._win.contentView.addChildView(this._hypnoBrowserView);
 			this._hypnoBrowserView.setVisible(false);
 
-			// Handle browser-to-ide data flow (Phase 4 integration)
+			// Handle browser-to-ide data flow
 			this._hypnoBrowserView.webContents.on('ipc-message', (event, channel, ...args) => {
-				if (channel === 'vscode:hypno-browser-click') {
+				if (channel === 'hypno-browser-reference') {
 					this._win.webContents.send('vscode:hypno-forward-to-continue', args[0]);
 				} else if (channel === 'vscode:hypno-browser-inspect-disabled') {
 					this._win.webContents.send('vscode:hypno-browser-inspect-disabled');
@@ -832,11 +832,17 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 								view.webContents.reload();
 								break;
 							case 'load-url': {
-								let targetUrl = message.action.url;
-								if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-									targetUrl = 'https://' + targetUrl;
+								let targetUrl = message.action.url.trim();
+								if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+									// Already a full URL
+									view.webContents.loadURL(targetUrl);
+								} else if (this._looksLikeUrl(targetUrl)) {
+									// Looks like a URL (e.g. "google.com", "localhost:3000")
+									view.webContents.loadURL('https://' + targetUrl);
+								} else {
+									// Treat as a search query
+									view.webContents.loadURL('https://www.google.com/search?q=' + encodeURIComponent(targetUrl));
 								}
-								view.webContents.loadURL(targetUrl);
 								break;
 							}
 							case 'inspect':
@@ -850,6 +856,30 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 					break;
 			}
 		});
+	}
+
+	/**
+	 * Determines if a string looks like a URL rather than a search query.
+	 * Matches patterns like "google.com", "example.co.uk", "localhost:3000", "192.168.1.1"
+	 */
+	private _looksLikeUrl(input: string): boolean {
+		// Contains spaces → definitely a search query
+		if (input.includes(' ')) {
+			return false;
+		}
+		// localhost with optional port
+		if (/^localhost(:\d+)?(\/.*)?$/.test(input)) {
+			return true;
+		}
+		// IP address with optional port
+		if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?(\/.*)?$/.test(input)) {
+			return true;
+		}
+		// Has a dot followed by a TLD-like segment (e.g. "google.com", "foo.bar.co.uk")
+		if (/^[^\s]+\.[a-z]{2,}(:\d+)?(\/.*)?$/i.test(input)) {
+			return true;
+		}
+		return false;
 	}
 
 	private marketplaceHeadersPromise: Promise<object> | undefined;

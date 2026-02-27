@@ -361,6 +361,11 @@
         "title": "Continue: Force Next Edit"
       },
       {
+        "command": "continue.addModelContext",
+        "category": "Continue",
+        "title": "Continue: Add Model Context"
+      },
+      {
         "command": "continue.acceptJump",
         "category": "Continue",
         "title": "Continue: Accept Jump Suggestion"
