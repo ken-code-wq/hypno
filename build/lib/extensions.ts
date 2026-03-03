@@ -320,6 +320,7 @@ const excludedExtensions = [
 	'vscode-test-resolver',
 	'ms-vscode.node-debug',
 	'ms-vscode.node-debug2',
+	'continue', // Has local file: dependencies that break production packaging
 ];
 
 const marketplaceWebExtensionsExclude = new Set([
